@@ -5,7 +5,6 @@ import { join } from 'path';
 import { mkdir, readdir, stat } from 'node:fs/promises';
 import { Logger } from '../utils/logger';
 import { calculateDirSha1Checksum } from '../utils/checksums';
-import { extractTar } from '../utils/tarExtractor';
 
 // GitHub API response type for repository info
 interface GitHubRepoInfo {
@@ -128,14 +127,11 @@ export class GitHubClient {
       const archiveData = await response.arrayBuffer();
       Logger.info(`Archive downloaded: ${archiveData.byteLength} bytes`);
       
-      // Decompress the gzipped tar archive
-      Logger.info(`Decompressing archive...`);
-      const tarData = Bun.gunzipSync(archiveData);
-      Logger.info(`Decompressed to: ${tarData.byteLength} bytes`);
-      
-      // Extract the tar archive using pure JavaScript
-      Logger.info(`Extracting tar archive to: ${tempDir}`);
-      await extractTar(tarData, tempDir);
+      // Extract the tar.gz archive using Bun.Archive
+      Logger.info(`Extracting archive to: ${tempDir}`);
+      const archive = new Bun.Archive(new Uint8Array(archiveData));
+      const entryCount = await archive.extract(tempDir);
+      Logger.info(`Extracted ${entryCount} entries`);
       
       // Find the extracted directory (it should be repo-name-branch)
       const extractedDirs = await this.getDirectories(tempDir);
