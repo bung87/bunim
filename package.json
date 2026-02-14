@@ -1,0 +1,16 @@
+{
+  "name": "bunim",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "boolean-sat": "^1.0.0",
+    "commander": "^14.0.3",
+    "simple-git": "^3.30.0"
+  }
+}

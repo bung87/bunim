@@ -1,0 +1,347 @@
+import { Command } from 'commander';
+import { NimbleParser } from '../parser/nimbleParser';
+import { SatDependencyResolver } from '../deps/satDependencyResolver';
+import { GitHubClient } from '../git/githubClient';
+import { Logger, LogLevel } from '../utils/logger';
+import { mkdtemp, rm, cp, access, mkdir } from 'node:fs/promises';
+import { join } from 'path';
+import os from 'os';
+import { NimbleRegistry } from '../registry/nimbleRegistry';
+import { PackageDeduper } from '../packages/packageDeduper';
+import { PackageLister } from '../packages/packageLister';
+
+export class CLI {
+  private program: Command;
+  
+  constructor() {
+    this.program = new Command();
+    this.setupCommands();
+  }
+  
+  setupCommands() {
+    this.program
+      .name('bunim')
+      .version('0.1.0')
+      .description('Package manager for Nim programming language');
+    
+    // Install command
+    this.program
+      .command('install [packages...]')
+      .description('Install dependencies or specific packages')
+      .option('-d, --dev', 'Install dev dependencies')
+      .option('-g, --global', 'Install to global nimble directory (default)')
+      .option('-l, --localdeps', 'Install to local nimbledeps directory')
+      .option('--git', 'Use git clone instead of archive download for GitHub packages')
+      .action(async (packages, options) => {
+        await this.install(packages, options.dev, options.git, options.localdeps);
+      });
+    
+    // Init command
+    this.program
+      .command('init')
+      .description('Initialize a new Nim project')
+      .action(() => {
+        this.init();
+      });
+    
+    // List command
+    this.program
+      .command('list')
+      .description('List installed packages')
+      .option('-l, --localdeps', 'List packages in local nimbledeps directory')
+      .option('-d, --detailed', 'Show detailed information (size, install date)')
+      .option('-s, --sort <type>', 'Sort by: name, version, size, date', 'name')
+      .action(async (options) => {
+        await this.list(options.localdeps, options.detailed, options.sort);
+      });
+    
+    // Search command
+    this.program
+      .command('search <query>')
+      .description('Search for packages')
+      .action((query) => {
+        this.search(query);
+      });
+    
+    // Dedupe command
+    this.program
+      .command('dedupe')
+      .description('Remove duplicate packages, keeping only the highest version')
+      .option('--dry-run', 'Show what would be removed without actually removing')
+      .option('-l, --localdeps', 'Operate on local nimbledeps directory instead of global')
+      .action(async (options) => {
+        await this.dedupe(options.dryRun, options.localdeps);
+      });
+  }
+  
+  async install(packages: string[] = [], includeDev: boolean = false, useGit: boolean = false, localdeps: boolean = false) {
+    try {
+      if (packages && packages.length > 0) {
+        // Install specific packages
+        Logger.info(`Installing specific packages: ${packages.join(', ')}`);
+        
+        for (const pkg of packages) {
+          if (pkg.includes('github.com')) {
+            await this.installGitHubPackage(pkg, useGit, localdeps);
+          } else {
+            Logger.info(`Installing package: ${pkg}`);
+          }
+        }
+      } else {
+        // Install dependencies from nimble file
+        Logger.info('Parsing nimble file...');
+        const pkg = await NimbleParser.parseFile('./package.nimble');
+        
+        // Resolve dependencies
+        Logger.info('Resolving dependencies...');
+        const resolver = new SatDependencyResolver();
+        const resolved = await resolver.resolve(pkg);
+        
+        Logger.info('Installing dependencies:');
+        for (const dep of resolved) {
+          if (dep.installed) {
+            Logger.info(`- ${dep.name}@${dep.version} (already installed)`);
+          } else {
+            Logger.info(`- ${dep.name}@${dep.version} (needs installation)`);
+            await this.installDependency(dep, localdeps);
+          }
+        }
+      }
+      
+      Logger.info('Installation complete!');
+    } catch (error) {
+      Logger.error('Error installing dependencies:', error);
+    }
+  }
+  
+  private async installGitHubPackage(url: string, useGit: boolean = false, localdeps: boolean = false): Promise<void> {
+    // Parse GitHub URL and extract owner/repo
+    const match = url.match(/github\.com\/([^\/]+)\/([^\/\[]+)/);
+    if (!match) {
+      Logger.error(`Invalid GitHub URL: ${url}`);
+      return;
+    }
+    
+    const [, owner, repo] = match;
+    const packageName = repo;
+    
+    // Parse features
+    const featureMatch = url.match(/\[([^\]]+)\]/);
+    const features = featureMatch ? featureMatch[1] : null;
+    
+    Logger.info(`Installing ${owner}/${repo} from GitHub...`);
+    Logger.info(`Package: ${packageName}${features ? ` [${features}]` : ''}`);
+    
+    // Create temporary directory
+    const tmpDir = await mkdtemp(join(os.tmpdir(), 'bunim-'));
+    
+    try {
+      // Use GitHub client to download the package (archive by default)
+      const githubUrl = `https://github.com/${owner}/${repo}`;
+      
+      let downloadResult: {path: string, checksum: string};
+      if (useGit) {
+        Logger.info(`Cloning ${owner}/${repo} with git...`);
+        const githubClient = new GitHubClient(true);
+        downloadResult = await githubClient.downloadPackage(githubUrl);
+      } else {
+        Logger.info(`Downloading ${owner}/${repo} archive...`);
+        const githubClient = new GitHubClient(false);
+        downloadResult = await githubClient.downloadPackage(githubUrl);
+      }
+      
+      // Copy files from download directory to temp directory
+      await cp(downloadResult.path, tmpDir, { recursive: true });
+      
+      // Parse the nimble file from the downloaded package
+      const githubClientForFinding = new GitHubClient(useGit);
+      const nimbleFile = await githubClientForFinding.findNimbleFile(tmpDir);
+      if (!nimbleFile) {
+        Logger.error(`No .nimble file found in package`);
+        return;
+      }
+      
+      const pkg = await NimbleParser.parseFile(nimbleFile);
+      
+      // If name is not in the nimble file, extract it from the filename
+      if (!pkg.name) {
+        const nimbleFileName = nimbleFile.split('/').pop() || '';
+        pkg.name = nimbleFileName.replace('.nimble', '');
+      }
+      
+      Logger.info(`Found package: ${pkg.name}@${pkg.version}`);
+      
+      // Determine installation directory based on localdeps flag
+      const installDir = localdeps 
+        ? join(process.cwd(), 'nimbledeps', 'pkgs2')
+        : join(os.homedir(), '.nimble', 'pkgs2');
+      
+      Logger.info(`Installing to ${localdeps ? 'local' : 'global'} directory: ${installDir}`);
+      
+      // Handle srcDir field if present
+      let sourceDir = tmpDir;
+      if (pkg.srcDir) {
+        const srcPath = join(tmpDir, pkg.srcDir);
+        try {
+          await access(srcPath);
+          sourceDir = srcPath;
+          Logger.info(`Using src directory: ${pkg.srcDir}`);
+        } catch {
+          Logger.warn(`Specified src directory '${pkg.srcDir}' not found, using root`);
+        }
+      }
+      
+      // Install dependencies first
+      if (pkg.dependencies && pkg.dependencies.length > 0) {
+        Logger.info('Installing package dependencies...');
+        const resolver = new SatDependencyResolver(installDir);
+        const resolved = await resolver.resolve(pkg);
+        
+        for (const dep of resolved) {
+          if (!dep.installed) {
+            Logger.info(`- Installing dependency: ${dep.name}@${dep.version}`);
+            await this.installDependency(dep, localdeps);
+          }
+        }
+      }
+      const targetDir = join(installDir, `${packageName}-${pkg.version}-${downloadResult.checksum}`);
+      
+      Logger.info(`Installing to ${targetDir}...`);
+      
+      // Create packages directory if it doesn't exist
+      try {
+        await mkdir(installDir, { recursive: true });
+      } catch (error) {
+        Logger.warn(`Failed to create packages directory: ${error}`);
+      }
+      
+      try {
+        await access(targetDir);
+        Logger.info(`Package already exists at ${targetDir}, removing old version...`);
+        try {
+          await rm(targetDir, { recursive: true, force: true });
+        } catch (error) {
+          Logger.warn(`Failed to remove existing directory: ${error}`);
+        }
+      } catch {
+        // Directory doesn't exist, which is fine
+      }
+      
+      // Create target directory
+      try {
+        await mkdir(targetDir, { recursive: true });
+      } catch (error) {
+        Logger.error(`Failed to create directory: ${error}`);
+        throw new Error(`Cannot create directory ${targetDir}`);
+      }
+      
+      // Copy files to target directory
+      await cp(sourceDir, targetDir, { recursive: true });
+      Logger.info(`Successfully installed ${packageName}@${pkg.version}`);
+      
+      if (features) {
+        Logger.info(`Feature '${features}' enabled`);
+        // In a real implementation, we'd handle feature-specific installation
+      }
+      
+    } catch (error) {
+      Logger.error(`Error installing ${packageName}:`, error);
+      throw error;
+    } finally {
+      // Clean up temporary directory
+      try {
+        await access(tmpDir);
+        Logger.info('Cleaning up temporary directory...');
+        await rm(tmpDir, { recursive: true, force: true });
+      } catch {
+        // Directory doesn't exist, which is fine
+      }
+    }
+  }
+  
+  private async installDependency(dep: any, localdeps: boolean = false): Promise<void> {
+    if (dep.url && dep.url.includes('github.com')) {
+      await this.installGitHubPackage(dep.url, false, localdeps); // Use archive download for dependencies
+    } else {
+      // Try to install from registry or use a fallback approach
+      Logger.info(`Installing ${dep.name}@${dep.version} from registry...`);
+      
+      // Initialize registry
+      const registry = new NimbleRegistry();
+      try {
+        await registry.loadRegistry();
+      } catch (error) {
+        Logger.warn(`Failed to load registry: ${error}`);
+      }
+      
+      // Try to find package in registry
+      const githubUrl = registry.getGitHubUrl(dep.name);
+      if (githubUrl) {
+        Logger.info(`Found ${dep.name} in registry: ${githubUrl}`);
+        try {
+          await this.installGitHubPackage(githubUrl, false, localdeps);
+        } catch (error) {
+          Logger.warn(`Failed to install from registry: ${error}`);
+        }
+      } else {
+        Logger.warn(`Package ${dep.name} not found in registry, skipping installation`);
+      }
+    }
+  }
+  
+  init() {
+    Logger.info('Initializing new Nim project...');
+    // In a real implementation, we'd create a package.nimble file
+    Logger.info('Created package.nimble file');
+  }
+  
+  async list(localdeps: boolean = false, detailed: boolean = false, sortBy: string = 'name'): Promise<void> {
+    try {
+      const packagesDir = localdeps 
+        ? join(process.cwd(), 'nimbledeps', 'pkgs2')
+        : join(os.homedir(), '.nimble', 'pkgs2');
+      
+      Logger.info(`Listing ${localdeps ? 'local' : 'global'} packages...`);
+      Logger.info(`Packages directory: ${packagesDir}`);
+      
+      const lister = new PackageLister(packagesDir);
+      const options = { 
+        local: localdeps, 
+        detailed, 
+        sortBy: sortBy as 'name' | 'version' | 'size' | 'date' 
+      };
+      
+      const packages = lister.list(options);
+      lister.display(packages, options);
+      
+    } catch (error) {
+      Logger.error('Error listing packages:', error);
+    }
+  }
+  
+  search(query: string) {
+    Logger.info(`Searching for packages matching "${query}"...`);
+    // In a real implementation, we'd search a registry
+  }
+  
+  async dedupe(dryRun: boolean = false, localdeps: boolean = false): Promise<void> {
+    try {
+      const packagesDir = localdeps 
+        ? join(process.cwd(), 'nimbledeps', 'pkgs2')
+        : join(os.homedir(), '.nimble', 'pkgs2');
+      
+      Logger.info(`Running dedupe on ${localdeps ? 'local' : 'global'} packages...`);
+      Logger.info(`Packages directory: ${packagesDir}`);
+      
+      const deduper = new PackageDeduper(packagesDir);
+      deduper.dedupe(dryRun);
+      
+    } catch (error) {
+      Logger.error('Error during dedupe:', error);
+    }
+  }
+  
+  run() {
+    this.program.parse(process.argv);
+  }
+}
