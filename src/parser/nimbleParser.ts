@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 export interface NimbleDependency {
   name: string;
   version: string;
-  url?: string;
+  url: string;
 }
 
 export interface NimblePackage {
@@ -148,7 +148,7 @@ export class NimbleParser {
     // Parse features into NimbleDependency arrays
     const parsedFeatures: Record<string, NimbleDependency[]> = {};
     if (result.features) {
-      for (const [featureName, featureDeps] of Object.entries(result.features)) {
+      for (const [featureName, featureDeps] of Object.entries(result.features as Record<string, string[]>)) {
         parsedFeatures[featureName] = this.parseDependencies(featureDeps);
       }
     }
@@ -209,7 +209,7 @@ export class NimbleParser {
     return value;
   }
 
-  private static parseDependencies(deps: any): NimbleDependency[] {
+  private static parseDependencies(deps: string[]): NimbleDependency[] {
     if (!deps || !Array.isArray(deps)) {
       return [];
     }
@@ -245,7 +245,7 @@ export class NimbleParser {
         return {
           name,
           version,
-          url: url || undefined
+          url: url
         };
       }
       throw new Error(`Invalid dependency format: ${dep}`);

@@ -37,7 +37,7 @@ export class DependencyResolver {
     }
     
     // Determine the repository URL
-    const url = dep.url || this.getGitHubUrl(dep.name);
+    const url = dep.url ;
     
     // Clone the repository to a temporary directory
     const tempDir = await this.gitHubClient.clone(url);
@@ -65,9 +65,5 @@ export class DependencyResolver {
     return resolvedDep;
   }
   
-  private getGitHubUrl(packageName: string): string {
-    // Default to nim-lang organization for now
-    // In a real implementation, we'd have a registry or mapping
-    return `https://github.com/nim-lang/${packageName}`;
-  }
+
 }

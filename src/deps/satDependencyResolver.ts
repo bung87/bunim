@@ -187,7 +187,11 @@ export class SatDependencyResolver {
       const nimVersion = this.getNimVersion();
       if (nimVersion && range !== '*' && range !== '') {
         try {
-          if (!Bun.semver.satisfies(nimVersion, range)) {
+          // Convert version to proper semver range (e.g., "2.0.0" -> ">=2.0.0")
+          const semverRange = range.startsWith('>=') || range.startsWith('>') || range.startsWith('<') || range.startsWith('<=') || range.startsWith('^') || range.startsWith('~')
+            ? range
+            : `>=${range}`;
+          if (!Bun.semver.satisfies(nimVersion, semverRange)) {
             Logger.warn(`Installed Nim version ${nimVersion} does not satisfy required range ${range}`);
           }
         } catch {
@@ -198,10 +202,9 @@ export class SatDependencyResolver {
       return clauses; // Return empty clauses - nim is a system dependency
     }
 
-    const versions = allDeps.get(depName) || [];
-
+    let versions = allDeps.get(depName) || [];
     // Filter versions that satisfy the range
-    const validVersions = versions.filter(v => {
+    let validVersions = versions.filter(v => {
       if (range === '*' || range === '') return true;
       try {
         return Bun.semver.satisfies(v, range);
@@ -210,9 +213,7 @@ export class SatDependencyResolver {
       }
     });
 
-    if (validVersions.length === 0) {
-      throw new Error(`No version of ${depName} satisfies range ${range}`);
-    }
+
 
     // At least one valid version must be selected
     const validVars = validVersions
@@ -293,7 +294,7 @@ export class SatDependencyResolver {
       return this.resolvedDeps.get(cacheKey)!;
     }
 
-    const url = dep.url || this.getGitHubUrl(dep.name);
+    const url = dep.url || this.getGitHubUrl(dep.name) || '';
     const installedVersion = await this.getLocalPackageVersion(dep.name);
     const installed = !!installedVersion;
     const selectedVersion = selectedVersions.get(dep.name) || dep.version;
@@ -317,11 +318,8 @@ export class SatDependencyResolver {
     return resolvedDep;
   }
 
-  private getGitHubUrl(packageName: string): string {
-    const githubUrl = this.registry.getGitHubUrl(packageName);
-    if (githubUrl) {
-      return githubUrl;
-    }
-    return `https://github.com/nim-lang/${packageName}`;
+  private getGitHubUrl(packageName: string): string | null {
+    return this.registry.getGitHubUrl(packageName);
+
   }
 }

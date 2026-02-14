@@ -5,10 +5,11 @@ import { join } from 'path';
 import { mkdir, readdir, stat } from 'node:fs/promises';
 import { Logger } from '../utils/logger';
 import { calculateDirSha1Checksum } from '../utils/checksums';
+import { findNimbleFile } from '../utils/nimbleUtils';
 
 // GitHub API response type for repository info
 interface GitHubRepoInfo {
-  default_branch?: string;
+  default_branch: string;
   [key: string]: any;
 }
 
@@ -49,7 +50,7 @@ export class GitHubClient {
     await git.clone(url, tempDir);
 
     // Parse the nimble file to get skipDirs and other metadata
-    const nimbleFile = await this.findNimbleFile(tempDir);
+    const nimbleFile = await findNimbleFile(tempDir);
     let skipDirs: string[] = [];
 
     if (nimbleFile) {
@@ -70,9 +71,7 @@ export class GitHubClient {
   }
   
   private async getDefaultBranch(owner: string, repo: string): Promise<string> {
-    try {
-      // Use Bun's native fetch for better performance
-      const apiUrl = `https://api.github.com/repos/${owner}/${repo}`;
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}`;
       Logger.info(`Fetching default branch from: ${apiUrl}`);
       
       const response = await fetch(apiUrl, {
@@ -84,19 +83,12 @@ export class GitHubClient {
       
       if (response.ok) {
         const repoInfo = await response.json() as GitHubRepoInfo;
-        const defaultBranch = repoInfo.default_branch || 'main';
+        const defaultBranch = repoInfo.default_branch;
         Logger.info(`Detected default branch: ${defaultBranch}`);
         return defaultBranch;
-      } else if (response.status === 403) {
-        throw new Error(`GitHub API rate limit exceeded (403). Please try again later or use --git flag to clone instead of downloading archive.`);
       } else {
-        Logger.warn(`GitHub API returned ${response.status}, using 'main' as default branch`);
-        return 'main';
+        return ''
       }
-    } catch (error) {
-      Logger.warn(`Failed to fetch default branch: ${error}`);
-      return 'main';
-    }
   }
   
   private async downloadArchive(url: string, tempDir: string): Promise<{path: string, checksum: string}> {
@@ -142,7 +134,7 @@ export class GitHubClient {
       }
       
       // Parse the nimble file to get skipDirs and other metadata
-      const nimbleFile = await this.findNimbleFile(extractedDir);
+      const nimbleFile = await findNimbleFile(extractedDir);
       let skipDirs: string[] = [];
 
       if (nimbleFile) {
@@ -182,16 +174,5 @@ export class GitHubClient {
     }
 
     return directories;
-  }
-  
-  async findNimbleFile(dirPath: string): Promise<string | null> {
-    try {
-      const entries = await readdir(dirPath);
-      const nimbleFile = entries.find((entry: string) => entry.endsWith('.nimble'));
-      return nimbleFile ? join(dirPath, nimbleFile) : null;
-    } catch (error) {
-      Logger.warn(`Error reading directory ${dirPath}: ${error}`);
-      return null;
-    }
   }
 }

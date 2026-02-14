@@ -127,7 +127,7 @@ export class NimbleRegistry {
     
     // Extract GitHub URL from various formats
     const url = pkg.url;
-    
+
     // Handle different GitHub URL formats
     if (url.includes('github.com')) {
       // Remove .git suffix if present

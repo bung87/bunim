@@ -3,8 +3,9 @@ import { NimbleParser } from '../parser/nimbleParser';
 import { SatDependencyResolver } from '../deps/satDependencyResolver';
 import { GitHubClient } from '../git/githubClient';
 import { Logger, LogLevel } from '../utils/logger';
+import { findNimbleFile } from '../utils/nimbleUtils';
 import { mkdtemp, rm, cp, access, mkdir } from 'node:fs/promises';
-import { join } from 'path';
+import { join,basename } from 'path';
 import os from 'os';
 import { NimbleRegistry } from '../registry/nimbleRegistry';
 import { PackageDeduper } from '../packages/packageDeduper';
@@ -90,7 +91,14 @@ export class CLI {
       } else {
         // Install dependencies from nimble file
         Logger.info('Parsing nimble file...');
-        const pkg = await NimbleParser.parseFile('./package.nimble');
+        const nimbleFile = await findNimbleFile();
+        
+        if (!nimbleFile) {
+          throw new Error('No .nimble file found in current directory');
+        }
+        
+        Logger.info(`Using nimble file: ${nimbleFile}`);
+        const pkg = await NimbleParser.parseFile(nimbleFile);
         
         // Resolve dependencies
         Logger.info('Resolving dependencies...');
@@ -154,8 +162,7 @@ export class CLI {
       await cp(downloadResult.path, tmpDir, { recursive: true });
       
       // Parse the nimble file from the downloaded package
-      const githubClientForFinding = new GitHubClient(useGit);
-      const nimbleFile = await githubClientForFinding.findNimbleFile(tmpDir);
+      const nimbleFile = await findNimbleFile(tmpDir);
       if (!nimbleFile) {
         Logger.error(`No .nimble file found in package`);
         return;
@@ -228,13 +235,14 @@ export class CLI {
       }
       
       // Create target directory
+
       try {
         await mkdir(targetDir, { recursive: true });
       } catch (error) {
         Logger.error(`Failed to create directory: ${error}`);
         throw new Error(`Cannot create directory ${targetDir}`);
       }
-      
+      await cp(nimbleFile, join(targetDir, basename(nimbleFile)))
       // Copy files to target directory
       await cp(sourceDir, targetDir, { recursive: true });
       Logger.info(`Successfully installed ${packageName}@${pkg.version}`);
