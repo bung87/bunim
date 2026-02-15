@@ -28,4 +28,23 @@ describe('NimbleParser', () => {
       await NimbleParser.parseFile('./nonexistent.nimble');
     }).toThrow();
   });
+
+  test('should parse opengl.nimble file correctly with srcDir', async () => {
+    const pkg = await NimbleParser.parseFile('./test/fixtures/opengl.nimble');
+
+    expect(pkg.version).toBe('1.2.9');
+    expect(pkg.author).toBe('Andreas Rumpf');
+    expect(pkg.description).toBe('an OpenGL wrapper');
+    expect(pkg.license).toBe('MIT');
+    expect(pkg.srcDir).toBe('src');
+
+    // Check dependencies - should have nim and x11 (platform-specific)
+    expect(pkg.dependencies).toBeDefined();
+    expect(pkg.dependencies?.length).toBeGreaterThanOrEqual(1);
+
+    // Verify nim dependency exists
+    const nimDep = pkg.dependencies?.find(d => d.name === 'nim');
+    expect(nimDep).toBeDefined();
+    expect(nimDep?.version).toBe('0.11.0');
+  });
 });

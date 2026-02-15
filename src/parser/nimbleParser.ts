@@ -110,6 +110,26 @@ export class NimbleParser {
         continue;
       }
 
+      // Check for when statements (conditional blocks)
+      const whenMatch = line.trim().match(/^when\s+defined\((\w+)\):/);
+      if (whenMatch) {
+        // Process any previous value before the when block
+        if (currentKey) {
+          result[currentKey] = this.parseValue(currentValue.join(' ').trim());
+          currentKey = null;
+          currentValue = [];
+        }
+        // Skip the when block and its contents for now
+        // In a full implementation, we'd parse platform-specific dependencies
+        continue;
+      }
+
+      // Check for else statement
+      if (line.trim() === 'else:') {
+        // Skip else block
+        continue;
+      }
+
       // Check if this line starts a new key-value pair
       const match = line.trim().match(/(\w+)\s*=\s*(.+)/);
       if (match) {

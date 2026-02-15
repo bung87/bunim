@@ -85,7 +85,7 @@ export class CLI {
           if (pkg.includes('github.com')) {
             await this.installGitHubPackage(pkg, useGit, localdeps);
           } else {
-            Logger.info(`Installing package: ${pkg}`);
+            await this.installRegistryPackage(pkg, useGit, localdeps);
           }
         }
       } else {
@@ -266,7 +266,33 @@ export class CLI {
       }
     }
   }
-  
+
+  private async installRegistryPackage(packageName: string, useGit: boolean = false, localdeps: boolean = false): Promise<void> {
+    Logger.info(`Installing package: ${packageName}`);
+
+    // Initialize registry
+    const registry = new NimbleRegistry();
+    try {
+      await registry.loadRegistry();
+    } catch (error) {
+      Logger.warn(`Failed to load registry: ${error}`);
+      return;
+    }
+
+    // Try to find package in registry
+    const githubUrl = registry.getGitHubUrl(packageName);
+    if (githubUrl) {
+      Logger.info(`Found ${packageName} in registry: ${githubUrl}`);
+      try {
+        await this.installGitHubPackage(githubUrl, useGit, localdeps);
+      } catch (error) {
+        Logger.error(`Failed to install ${packageName} from registry:`, error);
+      }
+    } else {
+      Logger.error(`Package ${packageName} not found in registry`);
+    }
+  }
+
   private async installDependency(dep: any, localdeps: boolean = false): Promise<void> {
     if (dep.url && dep.url.includes('github.com')) {
       await this.installGitHubPackage(dep.url, false, localdeps); // Use archive download for dependencies
