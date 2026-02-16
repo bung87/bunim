@@ -242,15 +242,27 @@ export class CLI {
         Logger.error(`Failed to create directory: ${error}`);
         throw new Error(`Cannot create directory ${targetDir}`);
       }
+      // Copy nimble file
       await cp(nimbleFile, join(targetDir, basename(nimbleFile)))
+      
+      // Copy main nim file if it exists (e.g., pkgname.nim)
+      // const mainNimFile = join(tmpDir, `${pkg.name}.nim`);
+      // try {
+      //   await access(mainNimFile);
+      //   await cp(mainNimFile, join(targetDir, `${pkg.name}.nim`));
+      //   Logger.info(`Copied main nim file: ${pkg.name}.nim`);
+      // } catch {
+      //   // Main nim file doesn't exist, which is fine
+      // }
+      
       // Copy files to target directory
       await cp(sourceDir, targetDir, { recursive: true });
       
       // Get list of installed files for nimblemeta.json
       const installedFiles = await this.getInstalledFiles(targetDir);
       
-      // Determine download method based on useGit flag
-      const downloadMethod: DownloadMethod = useGit ? 'git' : 'http';
+      // Always use 'git' as download method for compatibility with nimble
+      const downloadMethod: DownloadMethod = 'git';
       
       // Create and save nimblemeta.json
       const metaData = createPackageMetaData(
