@@ -4,12 +4,13 @@ import { SatDependencyResolver } from '../deps/satDependencyResolver';
 import { GitHubClient } from '../git/githubClient';
 import { Logger, LogLevel } from '../utils/logger';
 import { findNimbleFile } from '../utils/nimbleUtils';
-import { mkdtemp, rm, cp, access, mkdir } from 'node:fs/promises';
+import { mkdtemp, rm, cp, access, mkdir, readdir } from 'node:fs/promises';
 import { join,basename } from 'path';
 import os from 'os';
 import { NimbleRegistry } from '../registry/nimbleRegistry';
 import { PackageDeduper } from '../packages/packageDeduper';
 import { PackageLister } from '../packages/packageLister';
+import { saveMetaData, createPackageMetaData, DownloadMethod } from '../utils/nimblemeta';
 
 export class CLI {
   private program: Command;
@@ -131,14 +132,13 @@ export class CLI {
     }
     
     const [, owner, repo] = match;
-    const packageName = repo;
     
     // Parse features
     const featureMatch = url.match(/\[([^\]]+)\]/);
     const features = featureMatch ? featureMatch[1] : null;
     
     Logger.info(`Installing ${owner}/${repo} from GitHub...`);
-    Logger.info(`Package: ${packageName}${features ? ` [${features}]` : ''}`);
+    Logger.info(`Repository: ${repo}${features ? ` [${features}]` : ''}`);
     
     // Create temporary directory
     const tmpDir = await mkdtemp(join(os.tmpdir(), 'bunim-'));
@@ -211,7 +211,7 @@ export class CLI {
           }
         }
       }
-      const targetDir = join(installDir, `${packageName}-${pkg.version}-${downloadResult.checksum}`);
+      const targetDir = join(installDir, `${pkg.name}-${pkg.version}-${downloadResult.checksum}`);
       
       Logger.info(`Installing to ${targetDir}...`);
       
@@ -245,15 +245,33 @@ export class CLI {
       await cp(nimbleFile, join(targetDir, basename(nimbleFile)))
       // Copy files to target directory
       await cp(sourceDir, targetDir, { recursive: true });
-      Logger.info(`Successfully installed ${packageName}@${pkg.version}`);
       
+      // Get list of installed files for nimblemeta.json
+      const installedFiles = await this.getInstalledFiles(targetDir);
+      
+      // Determine download method based on useGit flag
+      const downloadMethod: DownloadMethod = useGit ? 'git' : 'http';
+      
+      // Create and save nimblemeta.json
+      const metaData = createPackageMetaData(
+        `https://github.com/${owner}/${repo}`,
+        downloadMethod,
+        downloadResult.checksum,
+        installedFiles,
+        [], // binaries - could be populated from nimble file
+        []  // specialVersions - could be populated if needed
+      );
+      await saveMetaData(metaData, targetDir);
+      
+      Logger.info(`Successfully installed ${pkg.name}@${pkg.version}`);
+
       if (features) {
         Logger.info(`Feature '${features}' enabled`);
         // In a real implementation, we'd handle feature-specific installation
       }
-      
+
     } catch (error) {
-      Logger.error(`Error installing ${packageName}:`, error);
+      Logger.error(`Error installing ${repo}:`, error);
       throw error;
     } finally {
       // Clean up temporary directory
@@ -377,5 +395,26 @@ export class CLI {
   
   run() {
     this.program.parse(process.argv);
+  }
+
+  /**
+   * Get list of all files in the installed package directory
+   * Excludes nimblemeta.json itself
+   */
+  private async getInstalledFiles(dir: string): Promise<string[]> {
+    const files: string[] = [];
+    const entries = await readdir(dir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const subFiles = await this.getInstalledFiles(fullPath);
+        files.push(...subFiles.map(f => `${entry.name}/${f}`));
+      } else if (entry.isFile() && entry.name !== 'nimblemeta.json') {
+        files.push(entry.name);
+      }
+    }
+
+    return files;
   }
 }

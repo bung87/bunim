@@ -2,7 +2,7 @@
 
 Bunim is a modern package manager for the Nim programming language, built with Bun and TypeScript.
 
-> **Note:** Bunim is not meant to replace Nimble. It will not pass Nimble's package check and is intended as an alternative tool for specific use cases. By default, it downloads tar.gz archives from GitHub for faster installations.
+> **Note:** Bunim is not meant to replace Nimble. It is intended as an alternative tool for specific use cases. By default, it downloads tar.gz archives from GitHub for faster installations.
 
 ## Features
 
