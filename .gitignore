@@ -54,6 +54,11 @@ bower_components
 
 build/Release
 
+# Bun compiled binary
+bunim
+bunim-x64
+bunim-arm64
+
 # Dependency directories
 
 node_modules/
