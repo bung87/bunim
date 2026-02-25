@@ -1,5 +1,5 @@
-import { NimbleDependency, NimblePackage } from '../parser/nimbleParser';
-import { readdir, access } from 'node:fs/promises';
+import { NimbleDependency, NimblePackage, NimbleParser } from '../parser/nimbleParser';
+import { readdir, access, readFile } from 'node:fs/promises';
 import { join } from 'path';
 import { NimbleRegistry } from '../registry/nimbleRegistry';
 import { Logger } from '../utils/logger';
@@ -255,19 +255,44 @@ export class SatDependencyResolver {
 
     try {
       const packages = await readdir(this.localPackagesDir);
+      
+      // First try: look for directory starting with packageName-
       const packageDirs = packages.filter((dir: string) => dir.startsWith(`${packageName}-`));
 
-      if (packageDirs.length === 0) {
-        return null;
+      if (packageDirs.length > 0) {
+        const versions = packageDirs.map((dir: string) => {
+          const versionMatch = dir.match(/^[^-]+-(.+)$/);
+          return versionMatch ? versionMatch[1] : '0.0.0';
+        });
+
+        versions.sort((a: string, b: string) => Bun.semver.order(b, a));
+        return versions[0];
       }
 
-      const versions = packageDirs.map((dir: string) => {
-        const versionMatch = dir.match(/^[^-]+-(.+)$/);
-        return versionMatch ? versionMatch[1] : '0.0.0';
-      });
+      // Second try: look through all packages and check their nimble files
+      // This handles cases where the requires name doesn't match the package name
+      // e.g., requires "nim-tinyfiledialogs" but package name is "tinyfiledialogs"
+      for (const dir of packages) {
+        const packageDir = join(this.localPackagesDir, dir);
+        try {
+          const entries = await readdir(packageDir);
+          const nimbleFile = entries.find(f => f.endsWith('.nimble'));
+          if (nimbleFile) {
+            const content = await readFile(join(packageDir, nimbleFile), 'utf8');
+            const pkg = NimbleParser.parseContent(content);
+            // Check if this package's name matches what we're looking for
+            if (pkg.name === packageName) {
+              // Extract version from directory name
+              const versionMatch = dir.match(/^[^-]+-(.+?)(?:-[a-f0-9]+)?$/);
+              return versionMatch ? versionMatch[1] : '0.0.0';
+            }
+          }
+        } catch {
+          // Skip packages we can't read
+        }
+      }
 
-      versions.sort((a: string, b: string) => Bun.semver.order(b, a));
-      return versions[0];
+      return null;
     } catch (error) {
       return null;
     }
@@ -294,19 +319,43 @@ export class SatDependencyResolver {
       return this.resolvedDeps.get(cacheKey)!;
     }
 
-    const url = dep.url || this.getGitHubUrl(dep.name) || '';
-    const installedVersion = await this.getLocalPackageVersion(dep.name);
+    // Check if dependency has explicit URL from nimble file
+    const hasExplicitUrl = !!dep.url;
+    Logger.info(`[DEBUG] Resolving ${dep.name}@${dep.version}, hasExplicitUrl: ${hasExplicitUrl}, dep.url: ${dep.url}`);
+    
+    // Get URL from either explicit dep.url or registry lookup
+    let url = dep.url || this.getGitHubUrl(dep.name) || '';
+    
+    // Only fetch actual package name from GitHub if:
+    // 1. The dependency has an explicit URL (from nimble file requires)
+    // 2. AND it's a GitHub URL
+    // This avoids fetching for registry packages
+    let actualPackageName = dep.name;
+    if (hasExplicitUrl && url && url.includes('github.com')) {
+      Logger.info(`[DEBUG] Fetching package name from GitHub: ${url}`);
+      const fetchedName = await this.fetchPackageNameFromGitHub(url);
+      if (fetchedName) {
+        actualPackageName = fetchedName;
+        Logger.info(`[DEBUG] Resolved ${dep.name} to actual package name: ${actualPackageName}`);
+      } else {
+        Logger.info(`[DEBUG] Could not fetch package name from GitHub, using original: ${dep.name}`);
+      }
+    } else {
+      Logger.info(`[DEBUG] Skipping GitHub fetch: hasExplicitUrl=${hasExplicitUrl}, url=${url}`);
+    }
+
+    const installedVersion = await this.getLocalPackageVersion(actualPackageName);
     const installed = !!installedVersion;
     const selectedVersion = selectedVersions.get(dep.name) || dep.version;
 
     const pkg: NimblePackage = {
-      name: dep.name,
+      name: actualPackageName,
       version: selectedVersion,
       dependencies: []
     };
 
     const resolvedDep: ResolvedDependency = {
-      name: dep.name,
+      name: actualPackageName,
       version: selectedVersion,
       url,
       package: pkg,
@@ -316,6 +365,81 @@ export class SatDependencyResolver {
 
     this.resolvedDeps.set(cacheKey, resolvedDep);
     return resolvedDep;
+  }
+
+  private async fetchPackageNameFromGitHub(url: string): Promise<string | null> {
+    try {
+      // Parse GitHub URL to get owner and repo
+      const match = url.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+      if (!match) return null;
+      
+      const [, owner, repo] = match;
+      
+      // First, get the default branch
+      const repoApiUrl = `https://api.github.com/repos/${owner}/${repo}`;
+      const repoResponse = await fetch(repoApiUrl);
+      if (!repoResponse.ok) {
+        Logger.warn(`Failed to fetch repo info from GitHub API`);
+        return null;
+      }
+      const repoInfo = await repoResponse.json();
+      const defaultBranch = repoInfo.default_branch || 'master';
+      
+      // Get the file list from the repo root
+      const contentsUrl = `https://api.github.com/repos/${owner}/${repo}/contents?ref=${defaultBranch}`;
+      const contentsResponse = await fetch(contentsUrl);
+      if (!contentsResponse.ok) {
+        Logger.warn(`Failed to fetch repo contents from GitHub API`);
+        return null;
+      }
+      const contents = await contentsResponse.json();
+      
+      // Find the nimble file
+      const nimbleFile = contents.find((file: any) => 
+        file.type === 'file' && file.name.endsWith('.nimble')
+      );
+      
+      if (!nimbleFile) {
+        Logger.warn(`No nimble file found in repo ${owner}/${repo}`);
+        return null;
+      }
+      
+      Logger.info(`Found nimble file: ${nimbleFile.name}`);
+      
+      // Fetch the nimble file content
+      const nimbleResponse = await fetch(nimbleFile.download_url);
+      if (!nimbleResponse.ok) {
+        Logger.warn(`Failed to fetch nimble file content`);
+        // Fallback: use nimble file name (without extension) as package name
+        return nimbleFile.name.replace(/\.nimble$/, '');
+      }
+      
+      const content = await nimbleResponse.text();
+      const extractedName = this.extractPackageName(content);
+      
+      // If no name field in nimble file, use the nimble file name (without extension)
+      // This follows Nimble's convention where package name defaults to the nimble file name
+      if (!extractedName) {
+        const fallbackName = nimbleFile.name.replace(/\.nimble$/, '');
+        Logger.info(`No name field in nimble file, using file name: ${fallbackName}`);
+        return fallbackName;
+      }
+      
+      return extractedName;
+    } catch (error) {
+      Logger.warn(`Error fetching package name from GitHub: ${error}`);
+      return null;
+    }
+  }
+
+  private extractPackageName(nimbleContent: string): string | null {
+    // Extract package name from nimble file content
+    // Look for "name = \"packagename\"" or "name = 'packagename'"
+    const nameMatch = nimbleContent.match(/name\s*=\s*["']([^"']+)["']/);
+    if (nameMatch) {
+      return nameMatch[1];
+    }
+    return null;
   }
 
   private getGitHubUrl(packageName: string): string | null {

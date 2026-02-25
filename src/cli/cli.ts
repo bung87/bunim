@@ -2,15 +2,16 @@ import { Command } from 'commander';
 import { NimbleParser } from '../parser/nimbleParser';
 import { SatDependencyResolver } from '../deps/satDependencyResolver';
 import { GitHubClient } from '../git/githubClient';
-import { Logger, LogLevel } from '../utils/logger';
+import { Logger } from '../utils/logger';
 import { findNimbleFile } from '../utils/nimbleUtils';
 import { mkdtemp, rm, cp, access, mkdir, readdir } from 'node:fs/promises';
-import { join,basename } from 'path';
+import { join,basename, resolve } from 'path';
 import os from 'os';
 import { NimbleRegistry } from '../registry/nimbleRegistry';
 import { PackageDeduper } from '../packages/packageDeduper';
 import { PackageLister } from '../packages/packageLister';
 import { saveMetaData, createPackageMetaData, DownloadMethod } from '../utils/nimblemeta';
+import { spawn } from 'node:child_process';
 
 export class CLI {
   private program: Command;
@@ -73,6 +74,22 @@ export class CLI {
       .option('-l, --localdeps', 'Operate on local nimbledeps directory instead of global')
       .action(async (options) => {
         await this.dedupe(options.dryRun, options.localdeps);
+      });
+
+    // Compile command (nimble c)
+    this.program
+      .command('c <file> [args...]')
+      .description('Compile a Nim file using the nimble environment')
+      .option('-r, --run', 'Run the compiled binary after compilation')
+      .option('-o, --output <path>', 'Output path for the compiled binary')
+      .option('-d, --define <symbols>', 'Define conditional symbols (comma-separated)')
+      .option('--opt <level>', 'Optimization level (none, speed, size)', 'speed')
+      .option('--threads', 'Enable threads')
+      .option('-l, --localdeps', 'Use local nimbledeps directory for paths')
+      .option('--noNimblePath', 'Disable nimble package paths')
+      .allowUnknownOption(true)
+      .action(async (file, args, options) => {
+        await this.compile(file, options, args || []);
       });
   }
   
@@ -327,7 +344,7 @@ export class CLI {
     if (dep.url && dep.url.includes('github.com')) {
       await this.installGitHubPackage(dep.url, false, localdeps); // Use archive download for dependencies
     } else {
-      // Try to install from registry or use a fallback approach
+      // Try to install from registry
       Logger.info(`Installing ${dep.name}@${dep.version} from registry...`);
       
       // Initialize registry
@@ -340,6 +357,7 @@ export class CLI {
       
       // Try to find package in registry
       const githubUrl = registry.getGitHubUrl(dep.name);
+      
       if (githubUrl) {
         Logger.info(`Found ${dep.name} in registry: ${githubUrl}`);
         try {
@@ -403,6 +421,425 @@ export class CLI {
     } catch (error) {
       Logger.error('Error during dedupe:', error);
     }
+  }
+
+  async compile(file: string, options: any, extraArgs: string[] = []): Promise<void> {
+    try {
+      const resolvedFile = resolve(file);
+      
+      // Check if file exists
+      try {
+        await access(resolvedFile);
+      } catch {
+        Logger.error(`File not found: ${file}`);
+        return;
+      }
+
+      // Check if it's a .nim file
+      if (!resolvedFile.endsWith('.nim')) {
+        Logger.error(`Not a Nim file: ${file}`);
+        return;
+      }
+
+      Logger.info(`Compiling: ${file}`);
+
+      // Determine nimble paths
+      const globalPackagesDir = join(os.homedir(), '.nimble', 'pkgs2');
+      const localPackagesDir = join(process.cwd(), 'nimbledeps', 'pkgs2');
+      
+      // Build nim compiler arguments
+      const nimArgs: string[] = ['c'];
+
+      // Add nimble package paths (unless --noNimblePath is set)
+      if (!options.noNimblePath) {
+        const nimPaths: string[] = [];
+        
+        // Find and parse nimble file to get dependencies
+        const nimbleFile = await findNimbleFile();
+        
+        if (nimbleFile) {
+          try {
+            const pkg = await NimbleParser.parseFile(nimbleFile);
+            
+            if (pkg.dependencies && pkg.dependencies.length > 0) {
+              Logger.info(`Resolving dependencies...`);
+              
+              // Use SatDependencyResolver to resolve dependencies
+              const resolver = new SatDependencyResolver(options.localdeps ? localPackagesDir : globalPackagesDir);
+              const resolvedDeps = await resolver.resolve(pkg);
+              
+              Logger.info(`Resolved ${resolvedDeps.length} dependencies`);
+              
+              // Get paths for resolved dependencies
+              for (const dep of resolvedDeps) {
+                if (dep.name === 'nim') continue; // Skip nim compiler dependency
+                
+                const packagesDir = options.localdeps ? localPackagesDir : globalPackagesDir;
+                const depPaths = await this.getResolvedDependencyPaths(packagesDir, dep.name, dep.version);
+                
+                if (depPaths.length === 0 && !dep.installed) {
+                  // Dependency not found, try to install it
+                  Logger.info(`Dependency ${dep.name}@${dep.version} not found, installing...`);
+                  try {
+                    await this.installDependency(dep, options.localdeps);
+                    // After installation, use the resolved name (which may differ from original requires name)
+                    // to get paths for the newly installed package
+                    const newDepPaths = await this.getResolvedDependencyPaths(packagesDir, dep.name, dep.version);
+                    if (newDepPaths.length === 0) {
+                      // If still not found, the dep.name might be the original requires name
+                      // Try to find by checking what was actually installed
+                      Logger.warn(`Could not find paths for ${dep.name} after installation, trying alternative lookup...`);
+                    }
+                    nimPaths.push(...newDepPaths);
+                  } catch (installError) {
+                    Logger.warn(`Failed to install ${dep.name}: ${installError}`);
+                  }
+                } else {
+                  nimPaths.push(...depPaths);
+                }
+              }
+            }
+          } catch (error) {
+            Logger.warn(`Failed to resolve dependencies: ${error}`);
+          }
+        }
+
+        // Add --path:<path> arguments for each dependency
+        for (const nimPath of nimPaths) {
+          nimArgs.push(`--path:${nimPath}`);
+        }
+      }
+
+      // Add optimization level
+      if (options.opt) {
+        nimArgs.push(`--opt:${options.opt}`);
+      }
+
+      // Add threads if enabled
+      if (options.threads) {
+        nimArgs.push('--threads:on');
+      }
+
+      // Add defines
+      if (options.define) {
+        const defines = options.define.split(',');
+        for (const def of defines) {
+          nimArgs.push('-d', def.trim());
+        }
+      }
+
+      // Add output path if specified
+      if (options.output) {
+        nimArgs.push('-o', options.output);
+      }
+
+      // Filter out -r and .nim files from extraArgs to avoid duplication
+      const filteredExtraArgs = extraArgs?.filter(arg => 
+        arg !== '-r' && 
+        arg !== '--run' && 
+        !arg.endsWith('.nim')
+      ) || [];
+
+      // Add -r flag before the file if run option is set
+      if (options.run) {
+        nimArgs.push('-r');
+      }
+
+      // Add the file to compile (must come after -r)
+      nimArgs.push(resolvedFile);
+
+      // Add extra arguments to pass them to the compiled binary
+      // This only applies when using -r (run mode)
+      if (options.run && filteredExtraArgs.length > 0) {
+        nimArgs.push(...filteredExtraArgs);
+      }
+
+      Logger.info(`Running: nim ${nimArgs.join(' ')}`);
+
+      // Run nim compiler
+      const success = await this.runNimCompiler(nimArgs);
+
+      if (!success) {
+        Logger.error('Compilation failed');
+        return;
+      }
+
+      Logger.info('Compilation successful');
+
+    } catch (error) {
+      Logger.error('Error during compilation:', error);
+    }
+  }
+
+  private async getNimblePaths(packagesDir: string): Promise<string[]> {
+    const paths: string[] = [];
+    
+    try {
+      const entries = await readdir(packagesDir, { withFileTypes: true });
+      
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const packageDir = join(packagesDir, entry.name);
+          
+          // Try to parse the nimble file to get srcDir
+          const nimbleFile = await findNimbleFile(packageDir);
+          if (nimbleFile) {
+            try {
+              const pkg = await NimbleParser.parseFile(nimbleFile);
+              
+              // Add the main package directory
+              paths.push(packageDir);
+              
+              // Add src directory if specified
+              if (pkg.srcDir) {
+                const srcPath = join(packageDir, pkg.srcDir);
+                try {
+                  await access(srcPath);
+                  paths.push(srcPath);
+                } catch {
+                  // src directory doesn't exist
+                }
+              }
+            } catch {
+              // Failed to parse nimble file, just add the package directory
+              paths.push(packageDir);
+            }
+          } else {
+            // No nimble file, just add the package directory
+            paths.push(packageDir);
+          }
+        }
+      }
+    } catch {
+      // Directory doesn't exist or can't be read
+    }
+    
+    return paths;
+  }
+
+  private async getDependencyPaths(packagesDir: string, depName: string): Promise<string[]> {
+    const paths: string[] = [];
+    
+    try {
+      const entries = await readdir(packagesDir, { withFileTypes: true });
+      
+      // Find directories that start with the dependency name
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith(`${depName}-`)) {
+          const packageDir = join(packagesDir, entry.name);
+          
+          // Try to parse the nimble file to get srcDir
+          const nimbleFile = await findNimbleFile(packageDir);
+          if (nimbleFile) {
+            try {
+              const pkg = await NimbleParser.parseFile(nimbleFile);
+              
+              // Add the main package directory
+              paths.push(packageDir);
+              
+              // Add src directory if specified
+              if (pkg.srcDir) {
+                const srcPath = join(packageDir, pkg.srcDir);
+                try {
+                  await access(srcPath);
+                  paths.push(srcPath);
+                } catch {
+                  // src directory doesn't exist
+                }
+              }
+            } catch {
+              // Failed to parse nimble file, just add the package directory
+              paths.push(packageDir);
+            }
+          } else {
+            // No nimble file, just add the package directory
+            paths.push(packageDir);
+          }
+        }
+      }
+    } catch {
+      // Directory doesn't exist or can't be read
+    }
+    
+    return paths;
+  }
+
+  private async getResolvedDependencyPaths(packagesDir: string, depName: string, version: string): Promise<string[]> {
+    const paths: string[] = [];
+
+    // Extract clean version (remove hash suffix if present)
+    // Version can be: "0.10.18-634e8ce02fb5a9bbb3cf4f9853b7150ea21e35a9" or "0.10.18" or "#head-..."
+    const cleanVersion = version.replace(/^([^-]+)-[a-f0-9]+$/, '$1');
+
+    try {
+      await access(packagesDir);
+    } catch {
+      return paths;
+    }
+
+    try {
+      const entries = await readdir(packagesDir, { withFileTypes: true });
+
+      // First pass: look for directory starting with depName-
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+
+        // Match pattern: {name}-{version}-{hash} or {name}-{version}
+        const match = entry.name.match(new RegExp(`^${depName}-(.+?)(?:-[a-f0-9]+)?$`));
+        if (match) {
+          const pkgVersion = match[1];
+
+          // Check if this version satisfies the resolved version
+          // Compare both the full version and the clean version
+          if (pkgVersion === version ||
+              pkgVersion === cleanVersion ||
+              version === '*' ||
+              version === '' ||
+              version === '0.0.0' ||
+              cleanVersion === '0.0.0') {
+            const packageDir = join(packagesDir, entry.name);
+
+            // Try to parse the nimble file to get srcDir
+            const nimbleFile = await findNimbleFile(packageDir);
+            if (nimbleFile) {
+              try {
+                const pkg = await NimbleParser.parseFile(nimbleFile);
+
+                // Add the main package directory
+                paths.push(packageDir);
+
+                // Add src directory if specified
+                if (pkg.srcDir) {
+                  const srcPath = join(packageDir, pkg.srcDir);
+                  try {
+                    await access(srcPath);
+                    paths.push(srcPath);
+                  } catch {
+                    // src directory doesn't exist
+                  }
+                }
+              } catch {
+                // Failed to parse nimble file, just add the package directory
+                paths.push(packageDir);
+              }
+            } else {
+              // No nimble file, just add the package directory
+              paths.push(packageDir);
+            }
+
+            // Only add the first matching version
+            return paths;
+          }
+        }
+      }
+
+      // Second pass: look through all packages and check their nimble files
+      // This handles cases where the requires name doesn't match the package name
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+
+        const packageDir = join(packagesDir, entry.name);
+        try {
+          const nimbleFile = await findNimbleFile(packageDir);
+          if (nimbleFile) {
+            const pkg = await NimbleParser.parseFile(nimbleFile);
+
+            // Check if this package's name matches what we're looking for
+            if (pkg.name === depName) {
+              // Extract version from directory name
+              const versionMatch = entry.name.match(/^[^-]+-(.+?)(?:-[a-f0-9]+)?$/);
+              const pkgVersion = versionMatch ? versionMatch[1] : '0.0.0';
+
+              // Check if version matches
+              if (pkgVersion === version ||
+                  pkgVersion === cleanVersion ||
+                  version === '*' ||
+                  version === '' ||
+                  version === '0.0.0' ||
+                  cleanVersion === '0.0.0') {
+                // Add the main package directory
+                paths.push(packageDir);
+
+                // Add src directory if specified
+                if (pkg.srcDir) {
+                  const srcPath = join(packageDir, pkg.srcDir);
+                  try {
+                    await access(srcPath);
+                    paths.push(srcPath);
+                  } catch {
+                    // src directory doesn't exist
+                  }
+                }
+
+                // Only add the first matching version
+                return paths;
+              }
+            }
+          }
+        } catch {
+          // Skip packages we can't read
+        }
+      }
+    } catch {
+      // Directory doesn't exist or can't be read
+    }
+
+    return paths;
+  }
+
+  private runNimCompiler(args: string[]): Promise<boolean> {
+    return new Promise((resolve) => {
+      const nimProcess = spawn('nim', args, {
+        stdio: 'inherit',
+        shell: false
+      });
+
+      nimProcess.on('close', (code) => {
+        resolve(code === 0);
+      });
+
+      nimProcess.on('error', (error) => {
+        Logger.error(`Failed to start nim compiler: ${error.message}`);
+        resolve(false);
+      });
+    });
+  }
+
+  private getDefaultBinaryPath(nimFile: string): string {
+    // Remove .nim extension
+    const baseName = nimFile.replace(/\.nim$/, '');
+    
+    // On Windows, add .exe
+    if (process.platform === 'win32') {
+      return `${baseName}.exe`;
+    }
+    
+    return baseName;
+  }
+
+  private runBinary(binaryPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      Logger.info(`Running: ${binaryPath}`);
+
+      const binaryProcess = spawn(binaryPath, [], {
+        stdio: 'inherit',
+        shell: false
+      });
+
+      binaryProcess.on('close', (code) => {
+        if (code === 0) {
+          Logger.info(`Binary exited successfully`);
+        } else {
+          Logger.info(`Binary exited with code ${code}`);
+        }
+        resolve();
+      });
+
+      binaryProcess.on('error', (error) => {
+        Logger.error(`Failed to run binary: ${error.message}`);
+        reject(error);
+      });
+    });
   }
   
   run() {
