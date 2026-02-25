@@ -91,6 +91,15 @@ export class CLI {
       .action(async (file, args, options) => {
         await this.compile(file, options, args || []);
       });
+
+    // Path command (nimble path)
+    this.program
+      .command('path <package>')
+      .description('Show the installation path of a package')
+      .option('-l, --localdeps', 'Look in local nimbledeps directory')
+      .action(async (packageName, options) => {
+        await this.path(packageName, options.localdeps);
+      });
   }
   
   async install(packages: string[] = [], includeDev: boolean = false, useGit: boolean = false, localdeps: boolean = false) {
@@ -405,7 +414,54 @@ export class CLI {
     Logger.info(`Searching for packages matching "${query}"...`);
     // In a real implementation, we'd search a registry
   }
-  
+
+  async path(packageName: string, localdeps: boolean = false): Promise<void> {
+    try {
+      const packagesDir = localdeps
+        ? join(process.cwd(), 'nimbledeps', 'pkgs2')
+        : join(os.homedir(), '.nimble', 'pkgs2');
+
+      Logger.info(`Looking for package: ${packageName}`);
+
+      // Search for the package in the packages directory
+      const entries = await readdir(packagesDir, { withFileTypes: true });
+      let foundPath: string | null = null;
+
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          // Check if directory name starts with package name
+          if (entry.name.startsWith(`${packageName}-`)) {
+            foundPath = join(packagesDir, entry.name);
+            break;
+          }
+          // Also check the nimblemeta.json for the actual package name
+          const metaPath = join(packagesDir, entry.name, 'nimblemeta.json');
+          try {
+            const { readFile } = await import('node:fs/promises');
+            const metaContent = await readFile(metaPath, 'utf-8');
+            const meta = JSON.parse(metaContent);
+            if (meta.name === packageName) {
+              foundPath = join(packagesDir, entry.name);
+              break;
+            }
+          } catch {
+            // Meta file doesn't exist or can't be read, continue
+          }
+        }
+      }
+
+      if (foundPath) {
+        console.log(foundPath);
+      } else {
+        Logger.error(`Package "${packageName}" not found in ${localdeps ? 'local' : 'global'} packages`);
+        process.exit(1);
+      }
+    } catch (error) {
+      Logger.error(`Error finding package path: ${error}`);
+      process.exit(1);
+    }
+  }
+
   async dedupe(dryRun: boolean = false, localdeps: boolean = false): Promise<void> {
     try {
       const packagesDir = localdeps 
